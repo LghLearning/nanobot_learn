@@ -6,6 +6,9 @@ from lgh_agent.config import load_dotenv
 
 
 def test_load_dotenv_reads_key_value_pairs(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("LGH_AGENT_API_KEY", raising=False)
+    monkeypatch.delenv("LGH_AGENT_BASE_URL", raising=False)
+    monkeypatch.delenv("LGH_AGENT_MODEL", raising=False)
     env_file = tmp_path / ".env"
     env_file.write_text(
         "\n".join(

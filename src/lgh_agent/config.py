@@ -4,6 +4,13 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from lgh_agent.errors import ConfigError
+
+
+@dataclass(frozen=True, slots=True)
+class AppConfig:
+    workspace: Path
+
 
 @dataclass(frozen=True, slots=True)
 class OpenAICompatibleConfig:
@@ -13,6 +20,18 @@ class OpenAICompatibleConfig:
     timeout_s: float = 60.0
 
 
+def load_app_config(workspace: str | None = None) -> AppConfig:
+    """Load non-secret app settings."""
+
+    load_dotenv()
+    raw_workspace = workspace or os.getenv("LGH_AGENT_WORKSPACE")
+    if raw_workspace:
+        workspace_path = Path(raw_workspace).expanduser()
+    else:
+        workspace_path = _project_root() / ".lgh_agent"
+    return AppConfig(workspace=workspace_path)
+
+
 def load_openai_compatible_config() -> OpenAICompatibleConfig:
     """Load real model settings from environment variables."""
 
@@ -20,11 +39,14 @@ def load_openai_compatible_config() -> OpenAICompatibleConfig:
 
     api_key = os.getenv("LGH_AGENT_API_KEY")
     if not api_key:
-        raise ValueError("Missing LGH_AGENT_API_KEY.")
+        raise ConfigError("Missing LGH_AGENT_API_KEY. Add it to .env or your shell environment.")
 
     base_url = os.getenv("LGH_AGENT_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     model = os.getenv("LGH_AGENT_MODEL", "gpt-4.1-mini")
-    timeout_s = float(os.getenv("LGH_AGENT_TIMEOUT_S", "60"))
+    try:
+        timeout_s = float(os.getenv("LGH_AGENT_TIMEOUT_S", "60"))
+    except ValueError as exc:
+        raise ConfigError("LGH_AGENT_TIMEOUT_S must be a number, such as 60.") from exc
 
     return OpenAICompatibleConfig(
         api_key=api_key,
@@ -57,4 +79,8 @@ def load_dotenv(path: Path | None = None) -> None:
 
 
 def _default_env_path() -> Path:
-    return Path(__file__).resolve().parents[2] / ".env"
+    return _project_root() / ".env"
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[2]

@@ -7,6 +7,7 @@ import httpx
 from lgh_agent.agent.loop import AgentLoop
 from lgh_agent.agent.runner import AgentRunner
 from lgh_agent.config import OpenAICompatibleConfig
+from lgh_agent.errors import ProviderConnectionError, ProviderHTTPError, ProviderResponseError
 from lgh_agent.providers.fake import FakeProvider
 from lgh_agent.providers.openai_compat import OpenAICompatibleProvider
 
@@ -71,3 +72,78 @@ def test_openai_compatible_provider_uses_chat_completions() -> None:
     assert captured["url"] == "https://example.test/v1/chat/completions"
     assert captured["authorization"] == "Bearer test-key"
     assert '"model":"test-model"' in str(captured["payload"]).replace(" ", "")
+
+
+def test_openai_compatible_provider_wraps_http_errors() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text="bad key")
+
+    async def run_case() -> None:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            provider = OpenAICompatibleProvider(
+                OpenAICompatibleConfig(
+                    api_key="test-key",
+                    base_url="https://example.test/v1",
+                    model="test-model",
+                ),
+                client=client,
+            )
+            await provider.complete([{"role": "user", "content": "hello"}])
+
+    try:
+        asyncio.run(run_case())
+    except ProviderHTTPError as exc:
+        assert "HTTP 401" in str(exc)
+    else:
+        raise AssertionError("Expected ProviderHTTPError")
+
+
+def test_openai_compatible_provider_wraps_connection_errors() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("network down")
+
+    async def run_case() -> None:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            provider = OpenAICompatibleProvider(
+                OpenAICompatibleConfig(
+                    api_key="test-key",
+                    base_url="https://example.test/v1",
+                    model="test-model",
+                ),
+                client=client,
+            )
+            await provider.complete([{"role": "user", "content": "hello"}])
+
+    try:
+        asyncio.run(run_case())
+    except ProviderConnectionError as exc:
+        assert "Could not connect" in str(exc)
+    else:
+        raise AssertionError("Expected ProviderConnectionError")
+
+
+def test_openai_compatible_provider_wraps_invalid_response_shape() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"unexpected": "shape"})
+
+    async def run_case() -> None:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            provider = OpenAICompatibleProvider(
+                OpenAICompatibleConfig(
+                    api_key="test-key",
+                    base_url="https://example.test/v1",
+                    model="test-model",
+                ),
+                client=client,
+            )
+            await provider.complete([{"role": "user", "content": "hello"}])
+
+    try:
+        asyncio.run(run_case())
+    except ProviderResponseError as exc:
+        assert "Invalid chat completions response" in str(exc)
+    else:
+        raise AssertionError("Expected ProviderResponseError")

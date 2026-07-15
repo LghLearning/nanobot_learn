@@ -5,6 +5,11 @@ from typing import Any
 import httpx
 
 from lgh_agent.config import OpenAICompatibleConfig
+from lgh_agent.errors import (
+    ProviderConnectionError,
+    ProviderHTTPError,
+    ProviderResponseError,
+)
 from lgh_agent.providers.base import LLMResponse, Message
 
 
@@ -24,11 +29,11 @@ class OpenAICompatibleProvider:
     async def complete(self, messages: list[Message]) -> LLMResponse:
         client = self._client or httpx.AsyncClient(timeout=self.config.timeout_s)
         try:
-            response = await client.post(#发送http请求：请求地址，请求头，请求体
+            response = await client.post(
                 f"{self.config.base_url}/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {self.config.api_key}",#身份验证
-                    "Content-Type": "application/json",#声明数据格式是 JSON
+                    "Authorization": f"Bearer {self.config.api_key}",
+                    "Content-Type": "application/json",
                 },
                 json={
                     "model": self.config.model,
@@ -37,15 +42,31 @@ class OpenAICompatibleProvider:
             )
             response.raise_for_status()
             data = response.json()
-            return LLMResponse(content=_extract_content(data))#转换成统一格式
+            return LLMResponse(content=_extract_content(data))
+        except httpx.ConnectError as exc:
+            raise ProviderConnectionError(
+                "Could not connect to the model provider. Check LGH_AGENT_BASE_URL and your proxy/network."
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise ProviderConnectionError(
+                f"The model provider did not respond within {self.config.timeout_s} seconds."
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            body = exc.response.text[:300]
+            raise ProviderHTTPError(
+                f"Model provider returned HTTP {status}. Response: {body}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise ProviderConnectionError(f"Model provider request failed: {exc}") from exc
         finally:
-            if self._owns_client:#清理资源
+            if self._owns_client:
                 await client.aclose()
 
 
-def _extract_content(data: dict[str, Any]) -> str:#解析函数，
+def _extract_content(data: dict[str, Any]) -> str:
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError("Invalid chat completions response.") from exc
+        raise ProviderResponseError("Invalid chat completions response.") from exc
     return "" if content is None else str(content)

@@ -1,4 +1,5 @@
 .env
+.lgh_agent/
 .idea/
 .venv/
 venv/
