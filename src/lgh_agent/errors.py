@@ -19,3 +19,7 @@ class ProviderHTTPError(LghAgentError):
 
 class ProviderResponseError(LghAgentError):
     """Raised when the model provider response shape is invalid."""
+
+
+class ToolError(LghAgentError):
+    """Raised when a tool command is invalid or a tool cannot complete."""

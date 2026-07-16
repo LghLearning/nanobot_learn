@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from pathlib import Path
 
 from lgh_agent.agent.loop import AgentLoop
 from lgh_agent.agent.runner import AgentRunner
@@ -10,6 +11,7 @@ from lgh_agent.errors import LghAgentError
 from lgh_agent.providers.fake import FakeProvider
 from lgh_agent.providers.openai_compat import OpenAICompatibleProvider
 from lgh_agent.session import SessionStore
+from lgh_agent.tools import ToolRegistry, create_filesystem_tools
 
 
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit"}
@@ -20,6 +22,7 @@ def build_agent(
     use_real_provider: bool = False,
     session_name: str = "default",
     workspace: str | None = None,
+    tool_root: str | None = None,
 ) -> AgentLoop:
     if use_real_provider:
         provider = OpenAICompatibleProvider(load_openai_compatible_config())
@@ -27,22 +30,18 @@ def build_agent(
         provider = FakeProvider()
 
     app_config = load_app_config(workspace)
-    session_store = SessionStore(app_config.workspace, session_name=session_name)#聊天记录存储
+    session_store = SessionStore(app_config.workspace, session_name=session_name)
+
+
+    tool_root_path = Path(tool_root).expanduser() if tool_root else Path.cwd()#工具目录
+    tool_registry = ToolRegistry(create_filesystem_tools(tool_root_path))#创建工具
+
     return AgentLoop(
         AgentRunner(provider),
         history=session_store.load_history(),
-        on_message=session_store.append_message,#回调函数
+        on_message=session_store.append_message,
+        tools=tool_registry,
     )
-
-# AgentLoop
-#       │
-#       ├──AgentRunner
-#       │      │
-#       │      └──Provider
-#       │
-#       ├──history
-#       │
-#       └──on_message
 
 
 async def main(
@@ -50,17 +49,20 @@ async def main(
     *,
     session_name: str = "default",
     workspace: str | None = None,
+    tool_root: str | None = None,
 ) -> None:
     agent = build_agent(
         use_real_provider=use_real_provider,
         session_name=session_name,
         workspace=workspace,
+        tool_root=tool_root,
     )
     provider_name = "real provider" if use_real_provider else "fake provider"
     print(
         f"lgh_agent is ready using {provider_name} "
         f"in session '{session_name}'. Type 'exit' to quit."
     )
+    print("Try '/tools' or '/tool list_files .' to inspect the tool layer.")
 
     while True:
         try:
@@ -99,6 +101,11 @@ def run() -> None:
         default=None,
         help="Directory used to store sessions. Defaults to .lgh_agent in the project root.",
     )
+    parser.add_argument(
+        "--tool-root",
+        default=None,
+        help="Directory filesystem tools can access. Defaults to the current directory.",
+    )
     args = parser.parse_args()
     try:
         asyncio.run(
@@ -106,6 +113,7 @@ def run() -> None:
                 use_real_provider=args.real,
                 session_name=args.session,
                 workspace=args.workspace,
+                tool_root=args.tool_root,
             )
         )
     except LghAgentError as exc:
@@ -114,43 +122,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-
-   #              python cli.py
-   #                     │
-   #                     ▼
-   #                run()
-   #                     │
-   #       ┌─────────────┴─────────────┐
-   #       │                           │
-   # 解析命令行参数                asyncio.run()
-   #                                   │
-   #                                   ▼
-   #                                main()
-   #                                   │
-   #                                   ▼
-   #                             build_agent()
-   #                                   │
-   #      ┌───────────────┬────────────┴─────────────┐
-   #      │               │                          │
-   #  创建 Provider   加载配置与历史             创建 AgentLoop
-   #      │
-   #      ▼
-   #  进入 while True 聊天循环
-   #      │
-   #      ▼
-   #  input() 获取用户输入
-   #      │
-   #      ▼
-   #  await agent.ask(text)
-   #      │
-   #      ▼
-   #  AgentLoop → AgentRunner → Provider
-   #      │
-   #      ▼
-   #  大模型返回回复
-   #      │
-   #      ▼
-   #  保存历史记录
-   #      │
-   #      ▼
-   #  print(answer)
