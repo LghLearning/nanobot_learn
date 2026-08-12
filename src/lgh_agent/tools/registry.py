@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import shlex #安全解析命令字符串
+from typing import Any
+import shlex
 
 from lgh_agent.errors import ToolError
 from lgh_agent.tools.base import Tool, ToolResult
 
 
 class ToolRegistry:
-    """Stores tools and dispatches `/tool ...` commands."""
+    """Stores tools and dispatches both command and model tool calls."""
 
     def __init__(self, tools: list[Tool] | None = None) -> None:
         self._tools: dict[str, Tool] = {}
@@ -27,6 +28,30 @@ class ToolRegistry:
             tool = self._tools[name]
             lines.append(f"- {tool.name}: {tool.description}")
         return "\n".join(lines)
+
+    def openai_tool_schemas(self) -> list[dict[str, Any]]:
+        """Return tool schemas in OpenAI-compatible function format."""
+
+        schemas = []
+        for name in sorted(self._tools):
+            tool = self._tools[name]
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    },
+                }
+            )
+        return schemas
+
+    async def run_tool_call(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        tool = self._tools.get(name)
+        if tool is None:
+            raise ToolError(f"Unknown tool '{name}'.\n{self.describe_tools()}")
+        return await tool.run(arguments)
 
     async def run_command(self, text: str) -> ToolResult:
         """Parse and run a command like `/tool read_file pyproject.toml`."""
@@ -49,4 +74,5 @@ class ToolRegistry:
         tool = self._tools.get(tool_name)
         if tool is None:
             raise ToolError(f"Unknown tool '{tool_name}'.\n{self.describe_tools()}")
-        return await tool.run(parts[2:])
+        arguments = tool.parse_command_args(parts[2:])
+        return await tool.run(arguments)

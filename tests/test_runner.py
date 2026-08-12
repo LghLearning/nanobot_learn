@@ -8,8 +8,10 @@ from lgh_agent.agent.loop import AgentLoop
 from lgh_agent.agent.runner import AgentRunner
 from lgh_agent.config import OpenAICompatibleConfig
 from lgh_agent.errors import ProviderConnectionError, ProviderHTTPError, ProviderResponseError
+from lgh_agent.providers.base import LLMResponse, Message, ToolCall
 from lgh_agent.providers.fake import FakeProvider
 from lgh_agent.providers.openai_compat import OpenAICompatibleProvider
+from lgh_agent.tools import ToolRegistry, create_filesystem_tools
 
 
 def test_agent_loop_returns_fake_provider_response() -> None:
@@ -72,6 +74,67 @@ def test_openai_compatible_provider_uses_chat_completions() -> None:
     assert captured["url"] == "https://example.test/v1/chat/completions"
     assert captured["authorization"] == "Bearer test-key"
     assert '"model":"test-model"' in str(captured["payload"]).replace(" ", "")
+
+
+def test_openai_compatible_provider_sends_tools_and_parses_tool_calls() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = request.read().decode("utf-8")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": "{\"path\":\"note.txt\"}",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    async def run_case() -> LLMResponse:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            provider = OpenAICompatibleProvider(
+                OpenAICompatibleConfig(
+                    api_key="test-key",
+                    base_url="https://example.test/v1",
+                    model="test-model",
+                ),
+                client=client,
+            )
+            return await provider.complete(
+                [{"role": "user", "content": "read note"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "description": "Read file",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            )
+
+    response = asyncio.run(run_case())
+
+    assert '"tools"' in str(captured["payload"])
+    assert response.tool_calls == [
+        ToolCall(id="call_1", name="read_file", arguments={"path": "note.txt"})
+    ]
 
 
 def test_openai_compatible_provider_wraps_http_errors() -> None:
@@ -147,3 +210,50 @@ def test_openai_compatible_provider_wraps_invalid_response_shape() -> None:
         assert "Invalid chat completions response" in str(exc)
     else:
         raise AssertionError("Expected ProviderResponseError")
+
+
+def test_agent_runner_executes_model_tool_calls(tmp_path) -> None:
+    (tmp_path / "note.txt").write_text("tool result text", encoding="utf-8")
+
+    class ScriptedToolProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(
+            self,
+            messages: list[Message],
+            tools: list[dict] | None = None,
+        ) -> LLMResponse:
+            self.calls += 1
+            if self.calls == 1:
+                assert tools
+                return LLMResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="call_1",
+                            name="read_file",
+                            arguments={"path": "note.txt"},
+                        )
+                    ]
+                )
+            assert messages[-1]["role"] == "tool"
+            assert messages[-1]["content"] == "tool result text"
+            return LLMResponse(content="I read: tool result text")
+
+    provider = ScriptedToolProvider()
+    runner = AgentRunner(provider)
+    registry = ToolRegistry(create_filesystem_tools(tmp_path))
+    events = []
+
+    async def run_case() -> str:
+        return await runner.run(
+            [{"role": "user", "content": "read note.txt"}],
+            tools=registry,
+            on_tool_event=events.append,
+        )
+
+    assert asyncio.run(run_case()) == "I read: tool result text"
+    assert provider.calls == 2
+    assert len(events) == 1
+    assert events[0].name == "read_file"
+    assert events[0].arguments == {"path": "note.txt"}

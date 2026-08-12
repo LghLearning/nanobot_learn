@@ -1,24 +1,39 @@
 from __future__ import annotations
 
-from dataclasses import dataclass#用于快速创建数据类
-from typing import Protocol
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 
-Message = dict[str, str]
+Message = dict[str, Any]
 
 
-@dataclass(slots=True) #slots=True可以节省内存，禁止动态添加属性
-class LLMResponse:#统一格式，
+@dataclass(slots=True)
+class ToolCall:
+    """A normalized request from the model to run one tool."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(slots=True)
+class LLMResponse:
     """A normalized response returned by any model provider."""
 
-    content: str
+    content: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
 
 
-class LLMProvider(Protocol):#接口
+class LLMProvider(Protocol):
     """Common interface for model providers.
 
-    AgentRunner depends on this interface, not on a concrete model vendor.
+    Providers may receive tool schemas. If the model wants a tool, the provider
+    returns normalized ToolCall objects instead of hiding vendor-specific JSON.
     """
 
-    async def complete(self, messages: list[Message]) -> LLMResponse:#规定所有模型必须提供complete方法，返回LLMResponse对象
+    async def complete(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> LLMResponse:
         ...

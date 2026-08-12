@@ -2,46 +2,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from pathlib import Path
 
-from lgh_agent.agent.loop import AgentLoop
-from lgh_agent.agent.runner import AgentRunner
-from lgh_agent.config import load_app_config, load_openai_compatible_config
+from lgh_agent.api.server import serve
 from lgh_agent.errors import LghAgentError
-from lgh_agent.providers.fake import FakeProvider
-from lgh_agent.providers.openai_compat import OpenAICompatibleProvider
-from lgh_agent.session import SessionStore
-from lgh_agent.tools import ToolRegistry, create_filesystem_tools
+from lgh_agent.runtime import build_agent
+from lgh_agent.tools.base import ToolEvent
 
 
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit"}
 
 
-def build_agent(
-    *,
-    use_real_provider: bool = False,
-    session_name: str = "default",
-    workspace: str | None = None,
-    tool_root: str | None = None,
-) -> AgentLoop:
-    if use_real_provider:
-        provider = OpenAICompatibleProvider(load_openai_compatible_config())
-    else:
-        provider = FakeProvider()
-
-    app_config = load_app_config(workspace)
-    session_store = SessionStore(app_config.workspace, session_name=session_name)
-
-
-    tool_root_path = Path(tool_root).expanduser() if tool_root else Path.cwd()#工具目录
-    tool_registry = ToolRegistry(create_filesystem_tools(tool_root_path))#创建工具
-
-    return AgentLoop(
-        AgentRunner(provider),
-        history=session_store.load_history(),
-        on_message=session_store.append_message,
-        tools=tool_registry,
-    )
+def _print_tool_event(event: ToolEvent) -> None:
+    status = "ok" if event.ok else "error"
+    detail = event.content_preview if event.ok else event.error
+    print(f"[tool:{status}] {event.name} {event.arguments} -> {detail}")
 
 
 async def main(
@@ -56,6 +30,7 @@ async def main(
         session_name=session_name,
         workspace=workspace,
         tool_root=tool_root,
+        on_tool_event=_print_tool_event,
     )
     provider_name = "real provider" if use_real_provider else "fake provider"
     print(
@@ -86,6 +61,9 @@ async def main(
 
 def run() -> None:
     parser = argparse.ArgumentParser(description="Run lgh_agent.")
+    parser.add_argument("--serve", action="store_true", help="Run the HTTP API server.")
+    parser.add_argument("--host", default="127.0.0.1", help="HTTP server host.")
+    parser.add_argument("--port", type=int, default=8900, help="HTTP server port.")
     parser.add_argument(
         "--real",
         action="store_true",
@@ -108,14 +86,23 @@ def run() -> None:
     )
     args = parser.parse_args()
     try:
-        asyncio.run(
-            main(
+        if args.serve:
+            serve(
+                host=args.host,
+                port=args.port,
                 use_real_provider=args.real,
-                session_name=args.session,
                 workspace=args.workspace,
                 tool_root=args.tool_root,
             )
-        )
+        else:
+            asyncio.run(
+                main(
+                    use_real_provider=args.real,
+                    session_name=args.session,
+                    workspace=args.workspace,
+                    tool_root=args.tool_root,
+                )
+            )
     except LghAgentError as exc:
         print(f"Error: {exc}")
 

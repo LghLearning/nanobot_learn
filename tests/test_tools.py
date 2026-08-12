@@ -46,7 +46,7 @@ def test_filesystem_tools_block_paths_outside_root(tmp_path) -> None:
     try:
         asyncio.run(run_case())
     except ToolError as exc:
-        assert "outside the tool root" in str(exc)
+        assert "outside the workspace" in str(exc)
     else:
         raise AssertionError("Expected ToolError")
 
@@ -64,3 +64,19 @@ def test_agent_loop_routes_tool_commands_to_registry(tmp_path) -> None:
         {"role": "user", "content": "/tool read_file note.txt"},
         {"role": "assistant", "content": "hello from agent tool"},
     ]
+
+
+def test_filesystem_tools_write_append_and_search(tmp_path) -> None:
+    registry = ToolRegistry(create_filesystem_tools(tmp_path))
+
+    async def run_case() -> tuple[str, str]:
+        await registry.run_command("/tool write_file notes/todo.txt hello")
+        await registry.run_command("/tool append_file notes/todo.txt \" world\"")
+        search = await registry.run_command("/tool search_files world notes")
+        content = await registry.run_command("/tool read_file notes/todo.txt")
+        return search.content, content.content
+
+    search, content = asyncio.run(run_case())
+
+    assert content == "hello world"
+    assert "notes\\todo.txt:1: hello world" in search or "notes/todo.txt:1: hello world" in search
