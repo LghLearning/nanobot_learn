@@ -4,11 +4,15 @@ import asyncio
 import json
 import time
 import uuid
+from collections.abc import AsyncIterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from lgh_agent.automation.store import AutomationStore
+from lgh_agent.bus import InboundMessage, MessageBus, OutboundMessage
+from lgh_agent.channels import ChannelManager, WebhookAuthError
+from lgh_agent.config import load_app_config
 from lgh_agent.errors import LghAgentError
-from lgh_agent.runtime import build_agent
 from lgh_agent.tools.base import ToolEvent
 from lgh_agent.webui import WEBUI_HTML
 
@@ -39,7 +43,7 @@ def serve(
         workspace=workspace,
         tool_root=tool_root,
     )
-    server = ThreadingHTTPServer((host, port), create_handler(settings))
+    server = make_server(host=host, port=port, settings=settings)
     print(f"lgh_agent API server listening on http://{host}:{port}")
     try:
         server.serve_forever()
@@ -47,6 +51,15 @@ def serve(
         print()
     finally:
         server.server_close()
+
+
+def make_server(
+    *,
+    host: str,
+    port: int,
+    settings: ApiSettings,
+) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), create_handler(settings))
 
 
 def create_handler(settings: ApiSettings) -> type[BaseHTTPRequestHandler]:
@@ -73,6 +86,12 @@ def create_handler(settings: ApiSettings) -> type[BaseHTTPRequestHandler]:
                     }
                 )
                 return
+            if self.path == "/jobs":
+                self._send_json({"jobs": _jobs_json(settings)})
+                return
+            if self.path == "/channels":
+                self._send_json({"channels": _channels_json(settings)})
+                return
             self._send_json({"error": "not found"}, status=404)
 
         def do_POST(self) -> None:
@@ -81,10 +100,18 @@ def create_handler(settings: ApiSettings) -> type[BaseHTTPRequestHandler]:
                 if self.path == "/chat":
                     self._handle_chat(body)
                     return
+                if self.path == "/chat/stream":
+                    self._handle_chat_stream(body)
+                    return
                 if self.path == "/v1/chat/completions":
                     self._handle_chat_completions(body)
                     return
+                if self.path.startswith("/webhooks/"):
+                    self._handle_webhook(body)
+                    return
                 self._send_json({"error": "not found"}, status=404)
+            except WebhookAuthError as exc:
+                self._send_json({"error": str(exc)}, status=401)
             except LghAgentError as exc:
                 self._send_json({"error": str(exc)}, status=400)
             except ValueError as exc:
@@ -95,19 +122,53 @@ def create_handler(settings: ApiSettings) -> type[BaseHTTPRequestHandler]:
             if not isinstance(message, str) or not message:
                 raise ValueError("Request body must include a non-empty 'message'.")
             session = str(body.get("session") or "api")
-            answer, events = _run_agent_turn(
-                message,
-                session=session,
+            outbound = _run_bus_turn(
+                InboundMessage(
+                    content=message,
+                    session=session,
+                    use_real_provider=bool(body.get("real", settings.use_real_provider)),
+                ),
                 settings=settings,
-                use_real_provider=bool(body.get("real", settings.use_real_provider)),
             )
             self._send_json(
                 {
-                    "message": answer,
-                    "session": session,
-                    "tool_events": [_tool_event_json(event) for event in events],
+                    "message": outbound.content,
+                    "session": outbound.session,
+                    "tool_events": [_tool_event_json(event) for event in outbound.tool_events],
                 }
             )
+
+        def _handle_chat_stream(self, body: dict[str, Any]) -> None:
+            message = body.get("message")
+            if not isinstance(message, str) or not message:
+                raise ValueError("Request body must include a non-empty 'message'.")
+            session = str(body.get("session") or "api")
+            self._send_sse_headers()
+            try:
+                for item in _collect_bus_stream(
+                    InboundMessage(
+                        content=message,
+                        session=session,
+                        use_real_provider=bool(body.get("real", settings.use_real_provider)),
+                    ),
+                    settings=settings,
+                ):
+                    if isinstance(item, str):
+                        self._write_sse({"type": "delta", "delta": item})
+                    else:
+                        self._write_sse(
+                            {
+                                "type": "done",
+                                "session": item.session,
+                                "tool_events": [
+                                    _tool_event_json(event) for event in item.tool_events
+                                ],
+                            }
+                        )
+            except LghAgentError as exc:
+                self._write_sse({"type": "error", "error": str(exc)})
+            finally:
+                self.close_connection = True
 
         def _handle_chat_completions(self, body: dict[str, Any]) -> None:
             messages = body.get("messages")
@@ -115,13 +176,34 @@ def create_handler(settings: ApiSettings) -> type[BaseHTTPRequestHandler]:
                 raise ValueError("Request body must include 'messages' list.")
             text = _last_user_text(messages)
             session = str(body.get("session_id") or body.get("user") or "openai-api")
-            answer, events = _run_agent_turn(
-                text,
-                session=session,
+            outbound = _run_bus_turn(
+                InboundMessage(
+                    content=text,
+                    session=session,
+                    use_real_provider=settings.use_real_provider,
+                ),
                 settings=settings,
-                use_real_provider=settings.use_real_provider,
             )
-            self._send_json(_chat_completion_response(answer, events))
+            self._send_json(_chat_completion_response(outbound.content, outbound.tool_events))
+
+        def _handle_webhook(self, body: dict[str, Any]) -> None:
+            channel_name = self.path.removeprefix("/webhooks/").strip("/")
+            if not channel_name:
+                raise ValueError("Webhook path must include a channel name.")
+            outbound = _run_webhook_turn(
+                channel_name,
+                body,
+                authorization_header=self.headers.get("Authorization"),
+                settings=settings,
+            )
+            self._send_json(
+                {
+                    "message": outbound.content,
+                    "session": outbound.session,
+                    "channel": channel_name,
+                    "tool_events": [_tool_event_json(event) for event in outbound.tool_events],
+                }
+            )
 
         def _read_json(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0"))
@@ -149,29 +231,77 @@ def create_handler(settings: ApiSettings) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(raw)
 
+        def _send_sse_headers(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+        def _write_sse(self, payload: dict[str, Any]) -> None:
+            raw = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+            self.wfile.write(raw)
+            self.wfile.flush()
+
         def log_message(self, format: str, *args: Any) -> None:
             return
 
     return LghAgentHandler
 
 
-def _run_agent_turn(
-    message: str,
-    *,
-    session: str,
-    settings: ApiSettings,
-    use_real_provider: bool,
-) -> tuple[str, list[ToolEvent]]:
-    events: list[ToolEvent] = []
-    agent = build_agent(
-        use_real_provider=use_real_provider,
-        session_name=session,
+def _build_bus(settings: ApiSettings) -> MessageBus:
+    return MessageBus(
+        default_use_real_provider=settings.use_real_provider,
         workspace=settings.workspace,
         tool_root=settings.tool_root,
-        on_tool_event=events.append,
     )
-    answer = asyncio.run(agent.ask(message))
-    return answer, events
+
+
+def _build_channel_manager(settings: ApiSettings) -> ChannelManager:
+    app_config = load_app_config(settings.workspace)
+    return ChannelManager(bus=_build_bus(settings), app_config=app_config)
+
+
+def _channels_json(settings: ApiSettings) -> list[dict[str, object]]:
+    return _build_channel_manager(settings).describe()
+
+
+def _jobs_json(settings: ApiSettings) -> list[dict[str, object]]:
+    app_config = load_app_config(settings.workspace)
+    return [job.to_dict() for job in AutomationStore(app_config.workspace).list_jobs()]
+
+
+def _run_bus_turn(message: InboundMessage, *, settings: ApiSettings) -> OutboundMessage:
+    return asyncio.run(_build_bus(settings).submit(message))
+
+
+def _run_webhook_turn(
+    channel_name: str,
+    body: dict[str, Any],
+    *,
+    authorization_header: str | None,
+    settings: ApiSettings,
+) -> OutboundMessage:
+    async def run() -> OutboundMessage:
+        channel = _build_channel_manager(settings).get(channel_name)
+        return await channel.handle(
+            body,
+            authorization_header=authorization_header,
+            use_real_provider=settings.use_real_provider,
+        )
+
+    return asyncio.run(run())
+
+
+def _collect_bus_stream(
+    message: InboundMessage,
+    *,
+    settings: ApiSettings,
+) -> list[str | OutboundMessage]:
+    async def collect() -> list[str | OutboundMessage]:
+        return [item async for item in _build_bus(settings).submit_stream(message)]
+
+    return asyncio.run(collect())
 
 
 def _last_user_text(messages: list[Any]) -> str:

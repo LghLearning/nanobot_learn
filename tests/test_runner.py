@@ -36,6 +36,16 @@ def test_agent_loop_stores_history() -> None:
     ]
 
 
+def test_agent_loop_streams_answer_chunks() -> None:
+    async def run_case() -> list[str]:
+        agent = AgentLoop(AgentRunner(FakeProvider()))
+        return [chunk async for chunk in agent.ask_stream("hello")]
+
+    chunks = asyncio.run(run_case())
+
+    assert "".join(chunks) == "Echo: hello"
+
+
 def test_openai_compatible_provider_uses_chat_completions() -> None:
     captured: dict[str, object] = {}
 
@@ -135,6 +145,43 @@ def test_openai_compatible_provider_sends_tools_and_parses_tool_calls() -> None:
     assert response.tool_calls == [
         ToolCall(id="call_1", name="read_file", arguments={"path": "note.txt"})
     ]
+
+
+def test_openai_compatible_provider_streams_native_deltas() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = request.read().decode("utf-8")
+        return httpx.Response(
+            200,
+            content=(
+                'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n'
+                'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'
+                "data: [DONE]\n\n"
+            ),
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+    async def run_case() -> list[str]:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            provider = OpenAICompatibleProvider(
+                OpenAICompatibleConfig(
+                    api_key="test-key",
+                    base_url="https://example.test/v1",
+                    model="test-model",
+                ),
+                client=client,
+            )
+            return [
+                chunk
+                async for chunk in provider.stream([{"role": "user", "content": "hello"}])
+            ]
+
+    chunks = asyncio.run(run_case())
+
+    assert chunks == ["Hel", "lo"]
+    assert '"stream":true' in str(captured["payload"]).replace(" ", "")
 
 
 def test_openai_compatible_provider_wraps_http_errors() -> None:
@@ -257,3 +304,31 @@ def test_agent_runner_executes_model_tool_calls(tmp_path) -> None:
     assert len(events) == 1
     assert events[0].name == "read_file"
     assert events[0].arguments == {"path": "note.txt"}
+
+
+def test_agent_runner_streams_with_provider_native_stream() -> None:
+    class StreamingProvider:
+        async def complete(
+            self,
+            messages: list[Message],
+            tools: list[dict] | None = None,
+        ) -> LLMResponse:
+            return LLMResponse(content="ignored complete result")
+
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[dict] | None = None,
+        ):
+            yield "native "
+            yield "stream"
+
+    runner = AgentRunner(StreamingProvider())
+
+    async def run_case() -> list[str]:
+        return [
+            chunk
+            async for chunk in runner.run_stream([{"role": "user", "content": "hello"}])
+        ]
+
+    assert asyncio.run(run_case()) == ["native ", "stream"]

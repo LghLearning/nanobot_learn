@@ -4,18 +4,10 @@ import argparse
 import asyncio
 
 from lgh_agent.api.server import serve
+from lgh_agent.bus import MessageBus
+from lgh_agent.channels import CLIChannel
 from lgh_agent.errors import LghAgentError
-from lgh_agent.runtime import build_agent
-from lgh_agent.tools.base import ToolEvent
-
-
-EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit"}
-
-
-def _print_tool_event(event: ToolEvent) -> None:
-    status = "ok" if event.ok else "error"
-    detail = event.content_preview if event.ok else event.error
-    print(f"[tool:{status}] {event.name} {event.arguments} -> {detail}")
+from lgh_agent.gateway import serve_gateway
 
 
 async def main(
@@ -24,44 +16,31 @@ async def main(
     session_name: str = "default",
     workspace: str | None = None,
     tool_root: str | None = None,
+    stream: bool = False,
 ) -> None:
-    agent = build_agent(
-        use_real_provider=use_real_provider,
-        session_name=session_name,
+    bus = MessageBus(
+        default_use_real_provider=use_real_provider,
         workspace=workspace,
         tool_root=tool_root,
-        on_tool_event=_print_tool_event,
     )
-    provider_name = "real provider" if use_real_provider else "fake provider"
-    print(
-        f"lgh_agent is ready using {provider_name} "
-        f"in session '{session_name}'. Type 'exit' to quit."
+    channel = CLIChannel(
+        bus,
+        session_name=session_name,
+        use_real_provider=use_real_provider,
+        stream=stream,
     )
-    print("Try '/tools' or '/tool list_files .' to inspect the tool layer.")
-
-    while True:
-        try:
-            text = input("You: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-
-        if not text:
-            continue
-        if text.lower() in EXIT_COMMANDS:
-            break
-
-        try:
-            answer = await agent.ask(text)
-        except LghAgentError as exc:
-            print(f"Error: {exc}")
-            continue
-        print(f"Agent: {answer}")
+    await channel.run()
 
 
 def run() -> None:
     parser = argparse.ArgumentParser(description="Run lgh_agent.")
     parser.add_argument("--serve", action="store_true", help="Run the HTTP API server.")
+    parser.add_argument(
+        "--gateway",
+        action="store_true",
+        help="Run the HTTP API server plus background automation.",
+    )
+    parser.add_argument("--stream", action="store_true", help="Stream CLI responses in chunks.")
     parser.add_argument("--host", default="127.0.0.1", help="HTTP server host.")
     parser.add_argument("--port", type=int, default=8900, help="HTTP server port.")
     parser.add_argument(
@@ -86,7 +65,15 @@ def run() -> None:
     )
     args = parser.parse_args()
     try:
-        if args.serve:
+        if args.gateway:
+            serve_gateway(
+                host=args.host,
+                port=args.port,
+                use_real_provider=args.real,
+                workspace=args.workspace,
+                tool_root=args.tool_root,
+            )
+        elif args.serve:
             serve(
                 host=args.host,
                 port=args.port,
@@ -101,6 +88,7 @@ def run() -> None:
                     session_name=args.session,
                     workspace=args.workspace,
                     tool_root=args.tool_root,
+                    stream=args.stream,
                 )
             )
     except LghAgentError as exc:

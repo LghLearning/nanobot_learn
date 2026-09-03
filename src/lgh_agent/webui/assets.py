@@ -205,6 +205,16 @@ WEBUI_HTML = """<!doctype html>
       }
       messages.appendChild(article);
       article.scrollIntoView({ block: "end" });
+      return article;
+    }
+
+    function setMessageText(article, text) {
+      let textNode = article.childNodes[1];
+      if (!textNode) {
+        textNode = document.createTextNode("");
+        article.appendChild(textNode);
+      }
+      textNode.textContent = text;
     }
 
     form.addEventListener("submit", async (event) => {
@@ -215,16 +225,43 @@ WEBUI_HTML = """<!doctype html>
       addMessage("user", text);
       send.disabled = true;
       try {
-        const response = await fetch("/chat", {
+        const article = addMessage("assistant", "");
+        const response = await fetch("/chat/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ message: text, session: session.value || "web" })
         });
-        const data = await response.json();
         if (!response.ok) {
-          addMessage("assistant", data.error || "Request failed.", []);
-        } else {
-          addMessage("assistant", data.message, data.tool_events || []);
+          setMessageText(article, "Request failed.");
+          return;
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let answer = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const parts = buffer.split("\\n\\n");
+          buffer = parts.pop() || "";
+          for (const part of parts) {
+            if (!part.startsWith("data: ")) continue;
+            const event = JSON.parse(part.slice(6));
+            if (event.type === "delta") {
+              answer += event.delta;
+              setMessageText(article, answer);
+            } else if (event.type === "done") {
+              for (const toolEvent of event.tool_events || []) {
+                const trace = document.createElement("div");
+                trace.className = "tool-event";
+                trace.textContent = `${toolEvent.ok ? "tool" : "tool error"}: ${toolEvent.name} ${JSON.stringify(toolEvent.arguments)}\\n${toolEvent.content_preview || toolEvent.error || ""}`;
+                article.appendChild(trace);
+              }
+            } else if (event.type === "error") {
+              setMessageText(article, event.error || "Agent error.");
+            }
+          }
         }
       } catch (error) {
         addMessage("assistant", "Network error: " + error.message, []);

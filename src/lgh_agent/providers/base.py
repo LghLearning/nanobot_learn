@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -36,4 +37,11 @@ class LLMProvider(Protocol):
         messages: list[Message],
         tools: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
+        ...
+
+    def stream(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[str]:
         ...

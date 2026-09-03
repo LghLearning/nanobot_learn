@@ -10,6 +10,10 @@ from lgh_agent.errors import ConfigError
 @dataclass(frozen=True, slots=True)
 class AppConfig:
     workspace: Path
+    max_history_messages: int = 20
+    summary_message_limit: int = 12
+    webhook_token: str | None = None
+    channels_config_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,7 +33,18 @@ def load_app_config(workspace: str | None = None) -> AppConfig:
         workspace_path = Path(raw_workspace).expanduser()
     else:
         workspace_path = _project_root() / ".lgh_agent"
-    return AppConfig(workspace=workspace_path)
+    try:
+        max_history_messages = int(os.getenv("LGH_AGENT_MAX_HISTORY_MESSAGES", "20"))
+        summary_message_limit = int(os.getenv("LGH_AGENT_SUMMARY_MESSAGE_LIMIT", "12"))
+    except ValueError as exc:
+        raise ConfigError("History compaction settings must be integers.") from exc
+    return AppConfig(
+        workspace=workspace_path,
+        max_history_messages=max_history_messages,
+        summary_message_limit=summary_message_limit,
+        webhook_token=os.getenv("LGH_AGENT_WEBHOOK_TOKEN"),
+        channels_config_path=_resolve_channels_config_path(workspace_path),
+    )
 
 
 def load_openai_compatible_config() -> OpenAICompatibleConfig:
@@ -84,3 +99,11 @@ def _default_env_path() -> Path:
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _resolve_channels_config_path(workspace_path: Path) -> Path | None:
+    raw_path = os.getenv("LGH_AGENT_CHANNELS_CONFIG")
+    if raw_path:
+        return Path(raw_path).expanduser()
+    default_path = workspace_path / "channels.json"
+    return default_path if default_path.exists() else None

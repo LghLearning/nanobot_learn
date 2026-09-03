@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 import json
 from typing import Any
 
@@ -73,6 +74,56 @@ class OpenAICompatibleProvider:
             if self._owns_client:
                 await client.aclose()
 
+    async def stream(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[str]:
+        client = self._client or httpx.AsyncClient(timeout=self.config.timeout_s)
+        try:
+            payload: dict[str, Any] = {
+                "model": self.config.model,
+                "messages": messages,
+                "stream": True,
+            }
+            if tools:
+                payload["tools"] = tools
+                payload["tool_choice"] = "auto"
+
+            async with client.stream(
+                "POST",
+                f"{self.config.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.config.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    chunk = _parse_stream_line(line)
+                    if chunk is not None:
+                        yield chunk
+        except httpx.ConnectError as exc:
+            raise ProviderConnectionError(
+                "Could not connect to the model provider. Check LGH_AGENT_BASE_URL and your proxy/network."
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise ProviderConnectionError(
+                f"The model provider did not respond within {self.config.timeout_s} seconds."
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            body = exc.response.text[:300]
+            raise ProviderHTTPError(
+                f"Model provider returned HTTP {status}. Response: {body}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise ProviderConnectionError(f"Model provider request failed: {exc}") from exc
+        finally:
+            if self._owns_client:
+                await client.aclose()
+
 
 def _extract_response(data: dict[str, Any]) -> LLMResponse:
     try:
@@ -99,3 +150,20 @@ def _parse_tool_call(item: dict[str, Any]) -> ToolCall:
         )
     except (KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ProviderResponseError("Invalid tool call in provider response.") from exc
+
+
+def _parse_stream_line(line: str) -> str | None:
+    if not line.startswith("data: "):
+        return None
+    payload = line.removeprefix("data: ").strip()
+    if payload == "[DONE]":
+        return None
+    try:
+        data = json.loads(payload)
+        delta = data["choices"][0].get("delta") or {}
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+        raise ProviderResponseError("Invalid streaming chat completions response.") from exc
+    content = delta.get("content")
+    if content is None:
+        return None
+    return str(content)
