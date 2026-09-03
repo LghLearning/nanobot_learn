@@ -6,6 +6,11 @@ dependencies = [
     "httpx>=0.28.0,<1.0.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+]
+
 [project.scripts]
 lgh-agent = "lgh_agent.cli:run"
 
